@@ -17,13 +17,8 @@ async def test_flow_success(hass):
     assert result["errors"] is None
 
     with patch(
-        "homeassistant.components.kulersky.config_flow.pykulersky.discover_bluetooth_devices",
-        return_value=[
-            {
-                "address": "AA:BB:CC:11:22:33",
-                "name": "Bedroom",
-            }
-        ],
+        "homeassistant.components.kulersky.config_flow.pykulersky.discover",
+        return_value=["Light1", "Light2"],
     ), patch(
         "homeassistant.components.kulersky.async_setup", return_value=True
     ) as mock_setup, patch(
@@ -54,7 +49,7 @@ async def test_flow_no_devices_found(hass):
     assert result["errors"] is None
 
     with patch(
-        "homeassistant.components.kulersky.config_flow.pykulersky.discover_bluetooth_devices",
+        "homeassistant.components.kulersky.config_flow.pykulersky.discover",
         return_value=[],
     ), patch(
         "homeassistant.components.kulersky.async_setup", return_value=True
@@ -84,7 +79,7 @@ async def test_flow_exceptions_caught(hass):
     assert result["errors"] is None
 
     with patch(
-        "homeassistant.components.kulersky.config_flow.pykulersky.discover_bluetooth_devices",
+        "homeassistant.components.kulersky.config_flow.pykulersky.discover",
         side_effect=pykulersky.PykulerskyException("TEST"),
     ), patch(
         "homeassistant.components.kulersky.async_setup", return_value=True

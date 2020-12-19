@@ -2,7 +2,7 @@
 import asyncio
 from datetime import timedelta
 import logging
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import pykulersky
 
@@ -30,13 +30,15 @@ SUPPORT_KULERSKY = SUPPORT_BRIGHTNESS | SUPPORT_COLOR | SUPPORT_WHITE_VALUE
 
 DISCOVERY_INTERVAL = timedelta(seconds=60)
 
-PARALLEL_UPDATES = 0
 
-
-def check_light(light: pykulersky.Light):
-    """Attempt to connect to this light and read the color."""
-    light.connect()
-    light.get_color()
+async def connect_light(light: pykulersky.Light) -> Optional[pykulersky.Light]:
+    """Return the given light if it successfully connects."""
+    try:
+        await light.connect()
+    except pykulersky.PykulerskyException:
+        _LOGGER.debug("Unable to connect to '%s'", light.address, exc_info=True)
+        return None
+    return light
 
 
 async def async_setup_entry(
@@ -44,53 +46,41 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: Callable[[List[Entity], bool], None],
 ) -> None:
-    """Set up Kuler sky light devices."""
+    """Set up Kuler sky light lights."""
     if DOMAIN not in hass.data:
         hass.data[DOMAIN] = {}
-    if "devices" not in hass.data[DOMAIN]:
-        hass.data[DOMAIN]["devices"] = set()
-    if "discovery" not in hass.data[DOMAIN]:
-        hass.data[DOMAIN]["discovery"] = asyncio.Lock()
+    if "addresses" not in hass.data[DOMAIN]:
+        hass.data[DOMAIN]["addresses"] = set()
 
     async def discover(*args):
         """Attempt to discover new lights."""
-        # Since discovery needs to connect to all discovered bluetooth devices, and
-        # only rules out devices after a timeout, it can potentially take a long
-        # time. If there's already a discovery running, just skip this poll.
-        if hass.data[DOMAIN]["discovery"].locked():
-            return
+        lights = await pykulersky.discover()
 
-        async with hass.data[DOMAIN]["discovery"]:
-            bluetooth_devices = await hass.async_add_executor_job(
-                pykulersky.discover_bluetooth_devices
-            )
+        # Filter out already connected lights
+        new_lights = [
+            light
+            for light in lights
+            if light.address not in hass.data[DOMAIN]["addresses"]
+        ]
 
-            # Filter out already connected lights
-            new_devices = [
-                device
-                for device in bluetooth_devices
-                if device["address"] not in hass.data[DOMAIN]["devices"]
-            ]
+        connected_lights = filter(
+            None, await asyncio.gather(*(connect_light(light) for light in new_lights))
+        )
 
-            for device in new_devices:
-                light = pykulersky.Light(device["address"], device["name"])
-                try:
-                    # If the connection fails, either this is not a Kuler Sky
-                    # light, or it's bluetooth connection is currently locked
-                    # by another device. If the vendor's app is connected to
-                    # the light when home assistant tries to connect, this
-                    # connection will fail.
-                    await hass.async_add_executor_job(check_light, light)
-                except pykulersky.PykulerskyException:
-                    continue
-                # The light has successfully connected
-                hass.data[DOMAIN]["devices"].add(device["address"])
-                async_add_entities([KulerskyLight(light)], update_before_add=True)
+        entities = []
+        for light in connected_lights:
+            # The light has successfully connected
+            # Double-check the light hasn't been added in the meantime
+            if light.address not in hass.data[DOMAIN]["addresses"]:
+                hass.data[DOMAIN]["addresses"].add(light.address)
+                entities.append(KulerskyLight(light))
+
+        async_add_entities(entities, update_before_add=True)
 
     # Start initial discovery
     hass.async_create_task(discover())
 
-    # Perform recurring discovery of new devices
+    # Perform recurring discovery of new lights
     async_track_time_interval(hass, discover, DISCOVERY_INTERVAL)
 
 
@@ -108,16 +98,18 @@ class KulerskyLight(LightEntity):
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added to hass."""
         self.async_on_remove(
-            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.disconnect)
+            self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, self.on_hass_shutdown
+            )
         )
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
-        await self.hass.async_add_executor_job(self.disconnect)
+        await self._light.disconnect()
 
-    def disconnect(self, *args) -> None:
-        """Disconnect the underlying device."""
-        self._light.disconnect()
+    async def on_hass_shutdown(self, event):
+        """Execute when Home Assistant is shutting down."""
+        await self._light.disconnect()
 
     @property
     def name(self):
@@ -168,7 +160,7 @@ class KulerskyLight(LightEntity):
         """Return True if entity is available."""
         return self._available
 
-    def turn_on(self, **kwargs):
+    async def async_turn_on(self, **kwargs):
         """Instruct the light to turn on."""
         default_hs = (0, 0) if self._hs_color is None else self._hs_color
         hue_sat = kwargs.get(ATTR_HS_COLOR, default_hs)
@@ -187,19 +179,19 @@ class KulerskyLight(LightEntity):
 
         rgb = color_util.color_hsv_to_RGB(*hue_sat, brightness / 255 * 100)
 
-        self._light.set_color(*rgb, white_value)
+        await self._light.set_color(*rgb, white_value)
 
-    def turn_off(self, **kwargs):
+    async def async_turn_off(self, **kwargs):
         """Instruct the light to turn off."""
-        self._light.set_color(0, 0, 0, 0)
+        await self._light.set_color(0, 0, 0, 0)
 
-    def update(self):
+    async def async_update(self):
         """Fetch new state data for this light."""
         try:
-            if not self._light.connected:
-                self._light.connect()
+            if not await self._light.is_connected():
+                await self._light.connect()
             # pylint: disable=invalid-name
-            r, g, b, w = self._light.get_color()
+            r, g, b, w = await self._light.get_color()
         except pykulersky.PykulerskyException as exc:
             if self._available:
                 _LOGGER.warning("Unable to connect to %s: %s", self._light.address, exc)
